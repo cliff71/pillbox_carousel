@@ -1,0 +1,870 @@
+e#include <functional>
+#include <Arduino.h>
+#include "OneButton.h"
+#include <EEPROM.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <NTPClient.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#define ENABLE_GxEPD2_GFX 1
+#include <GxEPD2_BW.h>
+#include <FreeMonoBold10pt7b.h>
+#include <FreeSansBold12pt7b.h>
+#include <FreeSansBold9pt7b.h>
+#include <not_used_24.h>
+#include <copyright_12.h>
+#include <tick_24.h>
+#include "a4l_secrets.h"
+#include "a4lUtilities.h"
+#include <ArduinoJson.h>
+#include "BLESmartConfig.h"
+#include "a4l_time_functions.h"
+#include <AccelStepper.h>
+
+#define RST_PIN 14
+#define DC_PIN 27
+#define CS_PIN 26
+#define BUSY_PIN 32
+//#define SCL 27
+
+#define RESET_GPIO 0
+#define BATTERY_DATA_GPIO 34
+#define CLEAR_MATRIX 2
+
+#define GxEPD2_DISPLAY_CLASS GxEPD2_BW
+#define GxEPD2_DRIVER_CLASS GxEPD2_150_BN // DEPG0150BN 200x200, SSD1681, (FPC8101), TTGO T5 V2.4.1
+
+#define MAX_DISPLAY_BUFFER_SIZE 65536ul
+#define MAX_HEIGHT(EPD) (EPD::HEIGHT <= MAX_DISPLAY_BUFFER_SIZE / (EPD::WIDTH / 8) ? EPD::HEIGHT : MAX_DISPLAY_BUFFER_SIZE / (EPD::WIDTH / 8))
+// adapt the constructor parameters to your wiring
+GxEPD2_DISPLAY_CLASS<GxEPD2_DRIVER_CLASS, MAX_HEIGHT(GxEPD2_DRIVER_CLASS)> display(GxEPD2_DRIVER_CLASS(/*CS=*/CS_PIN, /*DC=*/DC_PIN, /*RST=*/RST_PIN, /*BUSY=*/BUSY_PIN));
+
+bool displayState = true;
+
+// Define the dimensions of the display
+const int DISPLAY_WIDTH = 200;
+const int DISPLAY_HEIGHT = 200;
+
+// Create a buffer to store the display content
+RTC_DATA_ATTR uint8_t displayBuffer[DISPLAY_WIDTH * DISPLAY_HEIGHT / 8]; // 1 bit per pixel
+
+const int gap = 2;
+const int bottomMargin = 22;
+const int boxSize = (display.width() - (gap * 8)) / 7;
+const int totalBoxSize = boxSize + gap;
+const int matrixWidth = 7 * (boxSize + gap);
+const int matrixHeight = 4 * (boxSize + gap);
+const int frameWidth = matrixWidth + gap;
+const int frameHeight = matrixHeight + gap;
+
+const int frameStartY = display.height() - frameHeight - bottomMargin;
+const char *daysOfWeek[] = {"SU", "MO", "TU", "WE", "TH", "FR", "SA"};
+const String periodName[] = {"MOR", "LCH", "TEA", "BED"};
+String dayName[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+
+int dayPort[] = {35, 39, 32, 36, 26, 14, 27};
+int periodPort[] = {17, 25, 13, 16};
+                  //17 Please change for new PCB
+// Initialize uid
+char uid[20] = "";
+           
+DeviceInfo deviceInfo = {
+  "Smart Pill Box",       //Device type
+  "PB.1.1.0",             //Device version
+  "ESP32",                //Device processor
+  "SWITCH",               //Device category
+  "Medication reminder system",//Device description
+  "apps4leisure",         //Device manufacturer
+  "PB",   
+  10  
+};
+
+enum State{
+  CONFIG_WIFI,
+  CONNECT_WIFI,
+  ADD_DEVICE,
+  GET_LOCATION,
+  GPRS_UPDATE,
+  SLEEP,
+  PROCESSING,
+  IDEL
+};
+
+State currentState = IDEL;
+
+
+struct wake {
+  byte BOOT = 0;
+  byte TIMER = 1;
+  byte EXT = 2;
+}wakeReason;
+
+
+#define DISPLAY_POWER 2
+#define BATTRIE_DATA_GPIO 34
+#define RESET_GPIO 0
+#define VIBRATION_SENSOR_GPIO 33
+#define ON_CHARGE 15
+
+//#define TIME_SLOTS 4
+
+
+
+
+
+/**/RTC_DATA_ATTR int bootCount = 0;
+
+OneButton resetButton(RESET_GPIO, true);
+OneButton resetMatrixButton(CLEAR_MATRIX, true);
+
+int period = 1000;
+unsigned long previousMillis = 0;
+unsigned long startTime;
+unsigned long interval = 60000;
+bool matrixChanged = false;
+
+int GTMOffset = 1;
+
+struct MyObject{
+  char friendlyName[30];
+  char times[4][6];
+  bool pillMatrix[4][7];
+  char ssid[20];
+  char password[20];
+  bool activePeriod[4];
+  int alarmOffset;
+  unsigned long clientId;
+  bool callWifiManager;   
+  char initialised[4];
+  char endbite[1];
+} customVar;
+
+int numPeriods = 4;
+int numDays = 7;
+bool testMode = false;
+bool setup_wifi = false;
+bool isRegistered = true;
+
+#define MIN_BATTERY_VOLTAGE 3.15
+#define MAX_BATTERY_VOLTAGE 3.9
+#define LED_PIN 19
+
+HTTPClient http;
+WiFiClient client;
+a4lUtilities utilities;
+TimeFunctions timeFunctions;
+
+
+///BLEWiFiManager bleWiFiManager(SERVICE_UUID, CHARACTERISTIC_UUID);
+
+BLESmartConfig bleConfig;
+
+void handleJson(const String& jsonPayload) {
+  Serial.println("Callback triggered with JSON payload:");
+  Serial.println(jsonPayload);
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, jsonPayload);
+
+  if (error) {
+      Serial.print("deserializeJson() failed: ");
+      Serial.println(error.c_str());
+      return; // Exit if deserialization failed
+  }
+
+  // Check and copy each key only if it exists
+  if (!doc["wifi_ssid"].isNull()) {
+      const char* tmpChar = doc["wifi_ssid"];
+      strcpy(customVar.ssid, tmpChar);
+      Serial.println(tmpChar);
+  } else {
+      Serial.println("Key 'wifi_ssid' is missing!");
+  }
+
+  if (!doc["wifi_password"].isNull()) {
+      const char* tmpChar = doc["wifi_password"];
+      strcpy(customVar.password, tmpChar);
+      Serial.println(tmpChar);
+  } else {
+      Serial.println("Key 'wifi_password' is missing!");
+  }
+
+  if (!doc["clientId"].isNull()) {
+      const char* tmpChar = doc["clientId"];
+      customVar.clientId = atol(tmpChar);
+      Serial.println(tmpChar);
+  } else {
+      Serial.println("Key 'clientId' is missing!");
+  }
+
+  customVar.callWifiManager = false;
+  EEPROM.put(0, customVar);
+  EEPROM.commit();
+  Serial.println("Config saved");
+
+  currentState = ADD_DEVICE;
+
+}
+
+AccelStepper stepper(AccelStepper::HALF4WIRE, 4, 17, 16, 13);
+//AccelStepper stepper(AccelStepper::FULL4WIRE, 16, 4, 17, 13);
+const int stepsPerSegment = 137;
+#define HOME_GPIO 36
+bool homeState = false;
+
+void setup(){
+
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // disable brownout detector
+
+  Serial.begin(115200);
+
+  delay(500);
+
+  EEPROM.begin(512);
+  EEPROM.get(0, customVar);
+  //If the flash memory hasent been initalised, set with
+  //default values ready for configuration.
+  if(!strcmp(customVar.initialised, "YES")){
+    strcpy(customVar.initialised,"YES");
+    strcpy(customVar.ssid, "");
+    strcpy(customVar.password, "");
+    customVar.clientId = 0;
+    customVar.callWifiManager = true; 
+    EEPROM.put(0, customVar);
+    EEPROM.commit();
+  };
+
+  //resetButton.attachClick(resetMatrixClick);
+  resetButton.attachLongPressStop(resetWifiClick);
+  resetMatrixButton.attachClick(resetMatrixClick);
+
+ 
+  String tmp_uid = WiFi.macAddress();
+  tmp_uid.replace(":", "");      // Remove colons
+  tmp_uid = "a4l-" + tmp_uid;    // Prepend "a4l-"
+  strcat(uid, tmp_uid.c_str());
+  Serial.println(uid);
+
+  pinMode(VIBRATION_SENSOR_GPIO, INPUT);
+  pinMode(RESET_GPIO, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN,HIGH);
+  delay(1000);
+  digitalWrite(LED_PIN,LOW);
+
+
+  for(int period = 0; period < 4; period ++){
+    pinMode(periodPort[period], OUTPUT);
+    digitalWrite(periodPort[period], LOW);
+    for (int day = 0; day < 7; day++){
+      pinMode(dayPort[day], INPUT);
+    }
+  }
+ ////strcpy(customVar.ssid, "stratton_bt2");
+  //customVar.callWifiManager = true;
+  if(utilities.isAllBlank(customVar.ssid) || customVar.callWifiManager){
+    currentState = CONFIG_WIFI;
+  }else{
+    currentState = CONNECT_WIFI;
+  }
+  initalise();
+  scanSwitchMatrix();
+  scanSwitchMatrixTest();
+
+  pinMode(HOME_GPIO, INPUT_PULLUP);
+
+
+  stepper.setMaxSpeed(40);        // slightly above target
+  stepper.setAcceleration(20);    // smooth start/stop
+  //stepper.setMaxSpeed(1000);
+  //stepper.setSpeed(50);	
+  
+}
+
+void loop(){
+
+  unsigned long currentMillis = millis();
+  static boolean trap;
+  resetButton.tick();
+  resetMatrixButton.tick();
+
+ //stepper.runSpeed();
+  if (homeState && digitalRead(HOME_GPIO) == LOW){
+    homeState = true;
+    //stepper.setCurrentPosition(0); // Reset position to zero when home is reached
+    Serial.println("Homed");
+  }else{
+    homeState = false;
+  }
+
+  stepper.move(stepsPerSegment);
+  Serial.println(digitalRead(HOME_GPIO));
+  stepper.run();
+  /*
+  while (stepper.distanceToGo() != 0)
+  {
+    //stepper.runSpeed();
+  if (!homeState && digitalRead(HOME_GPIO) == LOW){
+    homeState = true;
+    //stepper.setCurrentPosition(0); // Reset position to zero when home is reached
+    Serial.println("Homed");
+  }else{
+    homeState = false;
+  }
+    stepper.run();
+  }
+*/
+  delay(10);  // pause at segment
+
+  //readBatteryPower();
+  //readBatteryLreadBatteryPowerevel();
+/*
+  switch (currentState){
+    case CONFIG_WIFI:
+      Serial.println("Config wifi");
+      //Run BLESmartConfig
+      currentState = PROCESSING;
+      setBLESmartConfig();
+      break;
+
+    case CONNECT_WIFI:{
+      Serial.println(customVar.ssid);
+      Serial.println(customVar.password);
+        WiFi.begin(customVar.ssid,customVar.password);
+
+        unsigned long startAttemptTime = millis();
+
+        while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) {
+          Serial.print(".");
+          delay(500);
+        }
+        if(WiFi.status() == WL_CONNECTED){
+          initalise();
+          currentState = PROCESSING;
+        }
+      }
+      break;
+    case ADD_DEVICE:{
+      bleConfig.stopBLESmartConfig();
+      Serial.println("Add device");
+      registerDevice();
+      currentState = PROCESSING;
+      }
+      break;
+    case SLEEP:
+      setSleep();
+      delay(1000);
+      break;
+    case PROCESSING:
+      if (millis() - startTime < interval){
+        if (millis() - startTime > MILLS_SECS * 5) trap = false;
+        // Note vibration sensors must be at a slight incline 
+        // from the horizontal 
+        if(digitalRead(VIBRATION_SENSOR_GPIO) == HIGH && trap == false){
+          Serial.print("Tilt");
+          startTime = millis();
+          trap = true;
+        }
+        scanSwitchMatrix();
+        scanSwitchMatrixTest();
+      }else{
+        currentState = SLEEP;
+      }
+      //Serial.println("Processing");
+      //if(currentMillis - lastIdelMillis > 120000) currentState = SLEEP;
+      break;
+    case IDEL:
+      //if(currentMillis - lastIdelMillis > 120000) currentState = SLEEP;
+      //Serial.println("Idel");
+      break;
+  }
+      */
+
+  //delay(500);
+}
+
+void initalise(){
+  //utilities.checkForUpdates(deviceInfo);
+  //timeFunctions.initTimers();
+  //WakeReason reason = timeFunctions.getWakeReason();
+  //esp_sleep_wakeup_cause_t wakeup_reason;
+  //wakeup_reason = esp_sleep_get_wakeup_cause();
+  //Serial.println("Wake reason");
+  //Serial.println(wakeup_reason);
+  //get_times_settings();
+  
+  //if (wakeup_reason == wakeReason.BOOT){
+    for (int p = 0; p < numPeriods; p++){
+      for (int d = 0; d < numDays; d++){
+        customVar.pillMatrix[p][d] = false;
+      }
+    }
+
+   // EEPROM.put(0, customVar);
+   // EEPROM.commit();
+    buildMainDisplay();
+  //}else{
+  //  display.init(0, false); 
+    partialMatrixRefresh();
+  //} 
+  //Always set the matrix ports after the display initialisation
+  initMatrixPorts();
+  startTime = millis();
+}
+
+bool registerDevice(){
+
+  if(WiFi.status() != WL_CONNECTED) return false;
+
+  JsonDocument doc;
+
+  // Add root level properties
+  doc["message_type"] = "insert_update_device";
+  doc["device_type"] = deviceInfo.type;
+  doc["position"] = deviceInfo.position;
+  doc["friendly_name"] = "Smart Pillbox";
+  doc["type_short"] = deviceInfo.type_short;
+  doc["device_id"] = uid;
+  doc["client_id"] = customVar.clientId;
+  doc["version"] = deviceInfo.version;
+  doc["ip_address"] = WiFi.localIP().toString(); // Get IP address as String
+  doc["device_processor"] = deviceInfo.processor;
+
+  // Create the "json_config" object
+  JsonObject jsonConfig = doc["json_config"].to<JsonObject>();
+
+  // Create the "times" array within "json_config"
+  JsonArray timesArray = jsonConfig["times"].to<JsonArray>();
+
+  // Add time objects to the "times" array
+  const char* times[] = {"08:00", "12:00", "16:00", "20:00"};
+  for (size_t i = 0; i < 4; ++i) {
+    JsonObject timeObj = timesArray.add<JsonObject>();
+    timeObj["time"] = times[i];
+    timeObj["active"] = true; 
+  }
+
+  // Add the "offset" property to "json_config"
+  jsonConfig["offset"] = 0;
+
+  // Create the "json_settings" array within the root 
+  JsonArray settingsArray = doc["json_settings"].to<JsonArray>();
+  for (size_t i = 0; i < 7; ++i) {
+    JsonArray innerArray = settingsArray.add<JsonArray>();
+    for (size_t j = 0; j < 4; ++j) {
+      innerArray.add(false);
+    }
+  }
+
+  // Serialize the JSON document to a String
+  String jsonString;
+  serializeJson(doc, jsonString);
+
+  Serial.println(jsonString);
+  // Send the JSON to your backend (use your preferred method: HTTP POST, MQTT, etc.)
+  String response = sendToBackend(jsonString);
+  // Parse the JSON response
+  DeserializationError error = deserializeJson(doc, response);
+
+  // Check for parsing errors
+  if (error) {
+      Serial.print("JSON Parsing failed: ");
+      Serial.println(error.c_str());
+      return false;
+  }
+
+  // Extract values
+  bool success = doc["success"];  // Read success flag
+  const char* action = doc["action"];  // Read action value
+
+  // Output the results
+  Serial.print("Success: ");
+  Serial.println(success ? "Yes" : "No");
+  
+  Serial.print("Action: ");
+  Serial.println(action);
+  return true;
+}
+
+String sendToBackend(const String &data) {
+
+HTTPClient http;
+
+  http.begin("http://apps4leisure.com/smart_home/smart_home_endpoint.php");  // URL passed as an argument
+  http.addHeader("Content-Type", "application/json");
+  int httpResponseCode = http.POST(data);
+  String responseData = "";
+  // If the request was successful, read the response
+  if (httpResponseCode > 0) {
+    responseData = http.getString();  // Get the response body
+    Serial.printf("HTTP Response code: %d\n", httpResponseCode);
+    Serial.println("Response: " + responseData);  // Print the response data
+  } else {
+    Serial.printf("Error on sending %s: %s\n",  http.errorToString(httpResponseCode).c_str());
+  }
+
+  http.end();
+  
+  return responseData;  // Re
+
+}
+
+void buildMainDisplay(){
+  display.init(115200, true, 2, false); 
+  display.setRotation(4);               // Set the rotation (0, 1, 2, or 3) depending on your display
+  display.fillScreen(GxEPD_WHITE);      // Fill the screen with white background
+  display.setTextColor(GxEPD_BLACK);    // Set the text color to black
+
+  display.setFont(&FreeSansBold12pt7b);
+  printCentre("Smart Pill Box", 17);
+  display.setFont(&FreeSansBold9pt7b);
+  printCentre("apps4leisure", 36);
+  display.drawBitmap(156, 26, copyright_12, 12, 12, GxEPD_BLACK);
+  drawMatrix();
+  display.display();
+}
+
+void setup_message(){
+  display.init(115200, true, 2, false); 
+  display.setRotation(4);               // Set the rotation (0, 1, 2, or 3) depending on your display
+  display.fillScreen(GxEPD_WHITE);      // Fill the screen with white background
+  display.setTextColor(GxEPD_BLACK);    // Set the text color to black
+  display.setFont(&FreeSansBold12pt7b);
+  printCentre("Please setup",80);
+  printCentre("your pillbox",105);
+  printCentre("using the",130);
+  printCentre("companion app",155);
+  display.display();
+}
+
+void partialMatrixRefresh(){
+  display.firstPage();
+  do{
+    display.setPartialWindow(0, 65, display.width(), 185);
+    drawMatrix();
+  } while (display.nextPage());
+  display.firstPage();
+}
+
+void scanSwitchMatrix(){
+
+  for (int periodCount = 0; periodCount < 4; periodCount++){
+    //for (int z = 0; z < 4; z++){
+    //    pinMode(periodPort[z], INPUT);   
+    //}
+    pinMode(periodPort[periodCount], OUTPUT);  
+    digitalWrite(periodPort[periodCount], HIGH);
+    delay(10);
+    for (int day = 0; day < 7; day++){
+      if (digitalRead(dayPort[day]) == false){
+        if (customVar.pillMatrix[periodCount][day] == false){
+          matrixChanged = true;
+          customVar.pillMatrix[periodCount][day] = true;
+        }
+      }
+    }
+    digitalWrite(periodPort[periodCount], LOW);
+ 
+    delay(10);
+  }
+  if (matrixChanged){
+    matrixChanged = false;
+    Serial.println("Saved");
+    EEPROM.put(0, customVar);
+    EEPROM.commit();
+    // Perform partial screen refresh
+    display.firstPage();
+    do{
+      display.setPartialWindow(0, 65, display.width(), 185);
+      drawMatrix();
+    } while (display.nextPage());
+    display.firstPage();
+    //Update php endpoint
+    
+    if(WiFi.status() == WL_CONNECTED) sendPillMatrix(customVar.pillMatrix);
+    delay(100);
+  }
+}
+
+void drawMatrix(){
+  // Draw the days of week at the top and highlight the current day
+  int currentDay = 1;//timeFunctions.getWeekDay();
+  display.setFont(&FreeMonoBold10pt7b);
+  display.setCursor(4, frameStartY - 5);
+  display.setTextColor(GxEPD_BLACK);
+  for (int i = 0; i < 7; i++){
+    if (i == currentDay){
+      for (int j = 0; j < 2; j++){
+        display.drawRect(1 + (28 * i) + j, frameStartY - 19 + j, 29 - 2 * j, 18 - 2 * j, GxEPD_BLACK);
+      }
+    }
+    display.print(daysOfWeek[i]);
+    display.setCursor(display.getCursorX() + 4, display.getCursorY()); // Add a small gap
+  }
+  // Define matrix parameters
+  // Draw the matrix area as a black frame to be filled
+  display.fillRect(0, frameStartY, frameWidth, frameHeight, GxEPD_BLACK);
+  // Calculate the top-left corner position to center the matrix in the bottom section
+  int startX = (display.width() - matrixWidth) / 2;
+  int startY = frameStartY + gap;
+  // Draw the 7x4 matrix of boxes with a black gap and white fill
+  for (int period = 0; period < 4; period++){
+    for (int day = 0; day < 7; day++){
+      display.fillRect(startX + (day * totalBoxSize), startY + (period * totalBoxSize), boxSize, boxSize, GxEPD_WHITE); // Draw the white fill
+      display.drawRect(startX + (day * totalBoxSize), startY + (period * totalBoxSize), boxSize, boxSize, GxEPD_BLACK); // Draw the black gap (thick line)
+      if (!customVar.activePeriod[period]){
+        drawBitmap(not_used_24, 24, day, period);
+      }else{
+        if (customVar.pillMatrix[period][day])
+          drawBitmap(tick_24, 24, day, period);
+      }
+    }
+  }
+  //display.setCursor(4, 192);
+  double actualVoltage = ReadVoltage(analogRead(BATTRIE_DATA_GPIO)) * 2.07; 
+  int actualePercent = calcPercentage(actualVoltage, 3.00, 3.7);
+  if (actualePercent > 100 ) actualePercent = 100;
+  printCentre("Battery: " + String(readBatteryPower()) + "%", 195);
+}
+
+void drawBitmap(const uint8_t *imageData, int size, int day, int period){
+  // Draw the star shape using the bitmap data
+  int offsetX = (size == 24) ? 3 : 7;
+  int offsetY = (size == 24) ? 67 : 71;
+  for (int i = 0; i < size; i++){
+    for (int j = 0; j < size; j++){
+      uint8_t pixelData = pgm_read_byte(&imageData[i * (size / 8) + (j / 8)]);
+      uint8_t pixelBit = (pixelData >> (7 - j % 8)) & 0x01;
+      if (pixelBit == 1){                                                                                        // 119
+        display.drawPixel(offsetX + (28 * day) + j, offsetY + (28 * period) + i, GxEPD_BLACK); // Set the pixel to black
+      }
+    }
+  }
+}
+
+void printCentre(String text, int y){
+  int16_t tbx, tby;
+  uint16_t tbw, tbh;
+  display.getTextBounds(text, 0, 0, &tbx, &tby, &tbw, &tbh);
+  // center the bounding box by transposition of the origin:
+  int x = ((display.width() - tbw) / 2) - tbx;
+  display.setCursor(x, y);
+  display.print(text);
+}
+
+void resetMatrixClick(){
+  Serial.println("Reset pressed");
+  for (int p = 0; p < 4; p++){
+    for (int d = 0; d < 7; d++){
+      if (customVar.activePeriod[p]){
+        customVar.pillMatrix[p][d] = false;
+      }
+    }
+  }
+  matrixChanged = true;
+}
+
+void resetWifiClick(){
+  customVar.callWifiManager = true;
+  EEPROM.put(0, customVar);
+  EEPROM.commit();
+  ESP.restart();
+}
+
+void initMatrixPorts(){
+  for (int x = 0; x < 7; x++){
+    if (x < 4) pinMode(periodPort[x], OUTPUT);
+    pinMode(dayPort[x], INPUT);
+  }
+}
+
+void setSleep(){
+  //return;
+  // delay befor sleep to alow data to be sent
+  delay(500);
+
+  display.hibernate();
+  delay(1000);
+  esp_sleep_enable_timer_wakeup(1000ULL * MILLS_HOUR);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_33, 1);
+  Serial.println("Going to sleep");
+  delay(MILLS_SECS * 3);
+  esp_deep_sleep_start();
+}
+
+const char* boolToString(bool b) {
+  return b ? "true" : "false";
+}
+
+void get_times_settings(){
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("No wifi connection!");
+    return;
+  }
+  // Create a JSON document
+  JsonDocument doc;
+  // Add data to the JSON document
+  doc["message_type"] = "get_device";
+  doc["device_id"] = uid;
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  // Send the JSON string to the backend
+  // Sending a POST request and getting the response
+  String response = sendToBackend(jsonString);
+
+  // Use the response in your program
+  if (response.length() > 0) {
+    Serial.println("Backend Response: " + response);
+  } else {
+    Serial.println("Failed to get a response from the backend.");
+  }
+  
+  Serial.println(response);
+  // Extract the times_data array
+  // Parse the JSON data to get the json_config
+  DeserializationError error = deserializeJson(doc, response);
+  const char* jsonConfigString = doc["device"]["json_config"];
+  error = deserializeJson(doc, jsonConfigString);
+  //Now read the times data to setup the display
+  Serial.println(jsonConfigString);
+  JsonArray timesData = doc["times"];
+  // Iterate over the array and populate the customVar structure
+  for (int i = 0; i < timesData.size() && i < 4; i++) {
+    JsonObject obj = timesData[i];
+    const char* time = obj["time"];
+    bool active = obj["active"];
+    strncpy(customVar.times[i], time, sizeof(customVar.times[i]) - 1);
+    customVar.times[i][sizeof(customVar.times[i]) - 1] = '\0'; // Ensure null termination
+    customVar.activePeriod[i] = active;
+  }
+}
+
+// Function to convert pillMatrix to JSON and send it to backend
+void sendPillMatrix(bool pillMatrix[4][7]) {
+  // Create a JSON document
+  JsonDocument doc;
+ 
+  // Add data to the JSON document
+  doc["message_type"] = "insert_update_device";
+  doc["device_id"] = uid;
+  //JsonObject data = doc["data"].to<JsonObject>();
+  doc["battery_level"] = readBatteryPower();
+
+  JsonDocument tempDoc;
+  JsonArray array = tempDoc.to<JsonArray>(); // Create the nested array structure
+
+  for (int i = 0; i < 7; i++) {
+      JsonArray nested = array.add<JsonArray>(); // Create inner arrays
+      for (int j = 0; j < 4; j++) {
+          nested.add(customVar.pillMatrix[j][i]); // Add boolean values
+      }
+  }
+  
+  doc["json_settings"] = array;
+
+  String jsonString;
+  serializeJson(doc, jsonString);
+  Serial.println(jsonString);
+
+  // Send the JSON string to the backend
+  if (WiFi.status() == WL_CONNECTED) {
+    sendToBackend(jsonString);
+  }else {
+    Serial.println("WiFi Disconnected");
+  }
+}
+
+double ReadVoltage(double reading) {
+  //double reading = analogRead(sensorPin); // Reference voltage is 3v3 so maximum reading is 3v3 = 4095 in range 0 to 4095
+  if (reading < 1 || reading > 4095) return 0;
+  // return -0.000000000009824 * pow(reading,3) + 0.000000016557283 * pow(reading,2) + 0.000854596860691 * reading + 0.065440348345433;
+  return -0.000000000000016 * pow(reading, 4) + 0.000000000118171 * pow(reading, 3) - 0.000000301211691 * pow(reading, 2) + 0.001109019271794 * reading + 0.034143524634089;
+} 
+
+int calcPercentage(float actual, float min, float max){
+  //Serial.print("min:");
+  //Serial.println(min);
+  // Serial.print("max:");
+  //Serial.println(max);
+  int result = (actual - min) / (max - min) * 100;
+  if (result < 0) result = 0;
+  if (result > 100) result = 100;
+  return result;
+}
+
+void scanSwitchMatrixTest(){
+  Serial.println("         SUN  MON  TUE  WED  THU  FRI  SAT");
+  for (int periodCount = 0; periodCount < 4; periodCount++){
+    pinMode(periodPort[periodCount], OUTPUT);
+    digitalWrite(periodPort[periodCount], HIGH);
+    if (periodCount == 0)
+      Serial.print(" AM       ");
+    if (periodCount == 1)
+      Serial.print(" NOON     ");
+    if (periodCount == 2)
+      Serial.print(" TEA      ");
+    if (periodCount == 3)
+      Serial.print(" BED      ");
+    for (int i = 0; i < 7; i++){
+      Serial.print(digitalRead(dayPort[i]));
+      Serial.print("    ");
+    }
+    digitalWrite(periodPort[periodCount], LOW);
+    Serial.println("");
+   
+  }
+}
+
+/*
+int readBatteryLevel(){
+  float totalValue = 0;
+  for (int x = 0; x < 10; x++){
+    totalValue += analogRead(BATTERY_DATA_GPIO);
+    delay(100);
+  }
+  float avgValue = (totalValue / 10);
+  float battpc = (avgValue /4095) * 7.60;
+  float correctedValue = ( a * battpc)+ b;
+  int percentCharged = ((correctedValue - v_empty) / (v_full - v_empty)) * 100;
+  if (percentCharged < 0) percentCharged = 0;
+  if (percentCharged > 100) percentCharged = 100;
+  Serial.print(correctedValue);
+  Serial.print("= ");
+  Serial.println(percentCharged, 0);
+  return percentCharged;
+}
+*/
+
+void setBLESmartConfig(){
+  String deviceName = "a4l-";
+  deviceName += deviceInfo.type_short;
+  bleConfig.begin(deviceName.c_str());
+  bleConfig.setServiceUUID("12345678-1234-5678-1234-56789abcdef0");
+  bleConfig.setCharacteristicUUID("abcdef01-1234-5678-1234-56789abcdef1");
+  bleConfig.setJsonCallback(handleJson);
+}
+
+int readBatteryPower(){
+  float totalRawValue = 0;
+  for (int x = 0; x < 10; x++){
+    totalRawValue += analogRead(BATTERY_DATA_GPIO);
+    delay(100);
+  }
+  float raw = totalRawValue / 10;
+  Serial.print("Raw :");
+  Serial.println(raw);
+  float volts = raw * (3.3 / 4095);
+  Serial.print("Volts :");
+  Serial.println(volts);           //Volts Low  High
+  float batteryVoltage =  mapfloat(volts, 1.88, 2.81, 2.9, 4.00);
+  Serial.println(batteryVoltage);
+
+  int percentage = (batteryVoltage - MIN_BATTERY_VOLTAGE) * 100 / (MAX_BATTERY_VOLTAGE - MIN_BATTERY_VOLTAGE);
+  return constrain(percentage, 0, 100); // Ensure it's between 0 and 100
+
+}
+float mapfloat(float x, float in_min, float in_max, float out_min, float out_max){
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}

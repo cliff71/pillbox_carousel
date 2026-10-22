@@ -1,0 +1,149 @@
+
+
+
+void sendHttpRequest2() {
+
+  char commandBuffer[75];  // Stack-allocated buffer
+  //********************GSM Communication Starts********************/
+  Serial.println("");
+  Serial.println("********************GSM Communication Stops********************");
+
+  Serial2.println("ATE0");
+  sendATCommand("AT", "OK", 2000);
+
+  JsonDocument doc;
+  doc["message_type"] = "location_services";
+  doc["device_id"] = uid;
+  doc["lng"] = String(sim808Config.longitude);
+  doc["lat"] = String(sim808Config.latitude);
+  doc["charge"] = String(charge);
+  doc["clientId"] =  String(sim808Config.clientId);
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+
+  /*
+  String jsonPayload = "{\"message_type\":\"location_services\",";
+  jsonPayload += "\"device_id\":\"" + getDeviceId() + "\",";
+  jsonPayload += "\"long\":\"" + String(sim808Config.longitude) + "\",";
+  jsonPayload += "\"lat\":\"" + String(sim808Config.latitude) + "\",";
+  jsonPayload += "\"charge\":\"" + String(charge) + "\",";
+  jsonPayload += "\"clientId\":\"" + String(sim808Config.clientId) + "\"}";
+  */
+
+  Serial.println(jsonPayload);
+
+  // Set the APN (Access Point Name) for the GPRS connection
+  sprintf(commandBuffer, "AT+SAPBR=3,1,\"APN\",\"%s\"", sim808Config.apn);
+  sendATCommand(commandBuffer, "OK", 1000);
+
+  if (strlen(sim808Config.apnUser) > 0 && strlen(sim808Config.apnPass) > 0) {
+    // Build and send the command for user
+    sprintf(commandBuffer, "AT+SAPBR=3,1,\"USER\",\"%s\"", sim808Config.apnUser);
+    sendATCommand(commandBuffer, "OK", 1000);
+ 
+    // Build and send the command for password
+    sprintf(commandBuffer, "AT+SAPBR=3,1,\"PWD\",\"%s\"", sim808Config.apnPass);
+    sendATCommand(commandBuffer, "OK", 1000);
+  }
+
+  sendATCommand("AT+SAPBR=3,1,\"Contype\",\"GPRS\"", "OK", 1000);
+
+  // Open the GPRS bearer (start the GPRS connection)
+  sendATCommand("AT+SAPBR=1,1", "OK", 3000);
+  delay(4000);
+  // Query the GPRS bearer to verify the connection and get the IP address
+  String response = sendATCommand("AT+SAPBR=2,1", "", 2000);
+  Serial.println(extractIPAddress(response));
+  delay(4000);
+  // Initialize the HTTP service on the SIM808
+  sendATCommand("AT+HTTPINIT", "OK", 1000);
+
+  // Set the CID (Connection Identifier) to 1, which is the GPRS connection established earlier
+  sendATCommand("AT+HTTPPARA=\"CID\",1", "OK", 1000);
+
+  // Set the URL of the server to which the HTTP request will be sent
+  sprintf(commandBuffer, "AT+HTTPPARA=\"URL\",\"%s\"", SERVER);
+  sendATCommand(commandBuffer, "OK", 2000);
+
+  // Set the content type for the HTTP request to JSON
+  sendATCommand("AT+HTTPPARA=\"CONTENT\",\"application/json\"", "OK", 1000);
+
+  // Prepare the JSON payload to send in the HTTP POST request
+  sprintf(commandBuffer, "AT+HTTPDATA=%d,120000", jsonPayload.length());
+  // Send the actual JSON payload  
+  sendATCommand(commandBuffer, "DOWNLOAD", 1000);
+  //Serial.println(strlen(jsonPayload));
+  Serial2.println(jsonPayload);
+  delay(3000);
+  //memset(jsonPayload, 0, sizeof(jsonPayload));
+  //ShowSerialData;
+
+  // Start the HTTP POST action
+  sendATCommand("AT+HTTPACTION=1", "OK", 1000); ///Very important delay
+  delay(3000);
+  // Read the server's response to the HTTP POST request
+  response = sendATCommand("AT+HTTPREAD", "", 2000);  //was 3000
+  Serial.println(getJsonValue(response, "client_id"));
+
+  // Terminate the HTTP service
+  sendATCommand("AT+HTTPTERM", "OK", 500);
+
+  //Turn off the radio
+  //*** Disconnect wireless connection, Close Moving Scene *******
+  sendATCommand("AT+SAPBR=0,1", "OK", 500);
+  memset(commandBuffer, 0, sizeof(commandBuffer));
+ 
+  /********************GSM Communication Stops********************/
+}
+
+
+String getGPSCoordinates2() {
+  String lat = "";
+  String lng = "";
+  //String tm = "";
+  bool fixAcquired = false;
+  String gpsResponse;
+  
+  Serial2.println("ATE0");
+  // Turn on the GPS
+  sendATCommand("AT+CGNSPWR=1", "OK", 2000);
+  delay(2000); // Give it some time to start up
+
+  while (!fixAcquired) {
+    // Get GPS data
+    gpsResponse = sendATCommand("AT+CGNSINF", "", 2000);
+    Serial.println(gpsResponse);
+    // Check if GPS has a fix
+    if (gpsResponse.indexOf("+CGNSINF: 1") != -1) {
+      // Extract latitude, longitude, and altitude
+      int firstComma = gpsResponse.indexOf(',', 9); // Skip "+CGNSINF: "
+      int secondComma = gpsResponse.indexOf(',', firstComma + 1);
+      int thirdComma = gpsResponse.indexOf(',', secondComma + 1);
+      int fourthComma = gpsResponse.indexOf(',', thirdComma + 1);
+      //tm = gpsResponse.substring(secondComma + 1, thirdComma);
+
+      lat = gpsResponse.substring(thirdComma + 1, fourthComma);
+      int fifthComma = gpsResponse.indexOf(',', fourthComma + 1);
+      lng = gpsResponse.substring(fourthComma + 1, fifthComma);
+
+      // Check if we have valid lat/lng data
+      if (lat != "" && lng != "") {
+        fixAcquired = true;
+        sim808Location.longitude = lng.toFloat();
+        sim808Location.latitude = lat.toFloat();
+        Serial.println("Fix aquired");
+        Serial.println("Latitude: " + lat);
+        Serial.println("Longitude: " + lng);
+      } else {
+        Serial.println("No valid latitude, longitude, or altitude.");
+        delay(5000); // Wait for 5 seconds before checking again
+      }
+    } else {
+      Serial.println("No GPS fix yet. Waiting for GPS fix...");
+      delay(5000); // Wait for 5 seconds before checking again
+    }
+  }
+  // Turn on the GPS
+  sendATCommand("AT+CGNSPWR=0", "OK", 2000);  // Turn off GPS
+  return "Lat: " + lat + ", Lng: " + lng;
+}

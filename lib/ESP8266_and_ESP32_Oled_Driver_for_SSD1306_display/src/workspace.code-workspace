@@ -1,0 +1,11 @@
+{
+	"folders": [],
+	"settings": {},
+	"extensions": {
+		"recommendations": [
+			"moozzyk.arduino",
+			"vsciot-vscode.vscode-arduino",
+			"moozzyk.Arduino"
+		]
+	}
+}
